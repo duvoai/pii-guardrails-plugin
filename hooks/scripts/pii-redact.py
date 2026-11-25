@@ -47,7 +47,8 @@ Text to analyze:
 {content}
 </content>"""
 
-MAX_CONTENT_LENGTH = 50000  # Truncate very large content for API call
+MAX_CONTENT_LENGTH = 50000  # Max characters per API request chunk
+CHUNK_OVERLAP = 256
 
 
 def get_api_key():
@@ -58,13 +59,60 @@ def get_api_key():
     return key
 
 
-def call_haiku(content, api_key):
-    """Call Claude Haiku to detect PII in content. Returns list of {text, type}."""
-    if not content or not content.strip():
-        return []
+def _extract_pii_items(text):
+    """Extract and validate a JSON array of {text, type} dicts from model output."""
+    decoder = json.JSONDecoder()
+    idx = 0
+    while True:
+        start = text.find("[", idx)
+        if start == -1:
+            return []
+        try:
+            parsed, _ = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        if isinstance(parsed, list):
+            valid = [
+                {"text": item["text"], "type": item["type"]}
+                for item in parsed
+                if isinstance(item, dict)
+                and isinstance(item.get("text"), str)
+                and item["text"]
+                and isinstance(item.get("type"), str)
+                and item["type"]
+            ]
+            if valid or not parsed:
+                return valid
+        idx = start + 1
 
-    truncated = content[:MAX_CONTENT_LENGTH]
-    prompt = DETECTION_PROMPT.replace("{content}", truncated)
+
+def _chunk_content(content, max_len=MAX_CONTENT_LENGTH, overlap=CHUNK_OVERLAP):
+    """Split large content into bounded chunks, preferring line/whitespace breaks."""
+    if len(content) <= max_len:
+        return [content]
+    chunks = []
+    start = 0
+    n = len(content)
+    while start < n:
+        end = min(start + max_len, n)
+        if end < n:
+            split_at = content.rfind("\n", start + max_len // 2, end)
+            if split_at == -1:
+                split_at = content.rfind(" ", start + max_len // 2, end)
+            if split_at > start:
+                end = split_at + 1
+        chunks.append(content[start:end])
+        if end >= n:
+            break
+        next_start = end - min(overlap, max_len // 4)
+        start = max(start + 1, next_start)
+    return chunks
+
+
+def _call_haiku_chunk(chunk, api_key):
+    """Call Claude Haiku once on a bounded content chunk."""
+    prompt = DETECTION_PROMPT.replace("{content}", chunk)
 
     payload = json.dumps({
         "model": MODEL,
@@ -86,24 +134,54 @@ def call_haiku(content, api_key):
     resp = urllib.request.urlopen(req, timeout=25)
     body = json.loads(resp.read().decode("utf-8"))
 
-    text = body["content"][0]["text"].strip()
-
-    # Extract JSON array from response (handle markdown fences)
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if not match:
+    content_blocks = body.get("content") or []
+    text_parts = [
+        block.get("text", "")
+        for block in content_blocks
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
+    text = "\n".join(text_parts).strip()
+    if not text:
         return []
 
-    return json.loads(match.group(0))
+    return _extract_pii_items(text)
+
+
+def call_haiku(content, api_key):
+    """Call Claude Haiku to detect PII in content. Returns list of {text, type}."""
+    if not content or not content.strip():
+        return []
+
+    seen = set()
+    items = []
+    for chunk in _chunk_content(content):
+        if not chunk.strip():
+            continue
+        for item in _call_haiku_chunk(chunk, api_key):
+            key = (item["text"], item["type"])
+            if key not in seen:
+                seen.add(key)
+                items.append(item)
+    return items
 
 
 def redact(text, pii_items):
-    """Replace each PII occurrence with its typed tag."""
-    redacted = text
-    # Sort by length descending to avoid partial replacements
-    for item in sorted(pii_items, key=lambda x: len(x["text"]), reverse=True):
-        tag = f'[{item["type"]}]'
-        redacted = redacted.replace(item["text"], tag)
-    return redacted
+    """Replace each PII occurrence with its typed tag in a single non-cascading pass."""
+    replacements = {}
+    for item in pii_items:
+        if not isinstance(item, dict):
+            continue
+        pii_text = item.get("text")
+        pii_type = item.get("type")
+        if isinstance(pii_text, str) and pii_text and isinstance(pii_type, str) and pii_type:
+            replacements.setdefault(pii_text, f"[{pii_type}]")
+    if not replacements:
+        return text
+
+    # Longest match first, single-pass regex so inserted [TAG] markers are never re-matched
+    ordered = sorted(replacements, key=len, reverse=True)
+    pattern = re.compile("|".join(re.escape(tok) for tok in ordered))
+    return pattern.sub(lambda m: replacements[m.group(0)], text)
 
 
 def flatten_text(obj):
@@ -199,8 +277,11 @@ def main():
     # Read hook input from stdin
     try:
         hook_input = json.loads(sys.stdin.read())
-    except (json.JSONDecodeError, EOFError):
+    except (json.JSONDecodeError, EOFError, ValueError, UnicodeError):
         # Can't parse input — fail open
+        sys.exit(0)
+
+    if not isinstance(hook_input, dict):
         sys.exit(0)
 
     # Check for API key
@@ -219,11 +300,28 @@ def main():
             result = handle_post_tool_use(hook_input, api_key)
 
         print(result)
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, KeyError) as e:
-        # API call failed — fail open
-        print(json.dumps({
-            "systemMessage": f"guardrails-pii: PII detection unavailable ({type(e).__name__}). Tool call proceeded without redaction.",
-        }))
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+        OSError,
+        UnicodeError,
+    ) as e:
+        # API call or response parsing failed — fail open
+        print(
+            json.dumps(
+                {
+                    "systemMessage": (
+                        f"guardrails-pii: PII detection unavailable ({type(e).__name__})."
+                        " Tool call proceeded without redaction."
+                    ),
+                }
+            )
+        )
         sys.exit(0)
 
 
